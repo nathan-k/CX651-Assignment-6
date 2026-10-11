@@ -1,0 +1,47 @@
+(1) Running `time ./grep instance data/warnpeace.txt help` printed the 207
+matching lines followed by the timing summary. On my machine (8-core Mac)
+the run took about 0.009s real (wall-clock) time, 0.01s user time and
+0.00s system time. "real" is the elapsed time from start to finish, "user"
+is CPU time spent running our own code (scanning lines for the word), and
+"sys" is CPU time spent in the kernel on our behalf (open/read system
+calls). Because the serial version runs on a single thread, real time is
+roughly user + sys; the file is only ~3.3MB and is already in the OS page
+cache after the first run, so the search is very fast. On a 1GB file the
+serial version took 0.49s real (0.27s user, 0.19s sys).
+
+(2) Yes. A first approach of having every worker increment one shared
+global counter (and append to one shared instances array) is a data race:
+`count++` is a read-modify-write, so two threads can read the same old
+value and one increment is lost, giving a count that is sometimes too low.
+Appending to a shared array is worse because two threads can write the same
+slot or realloc the array out from under each other. I avoided this by
+restructuring the code so there is no shared mutable state: each thread
+gets its own `struct worker_args` holding its byte range and its own result
+(count and instances array). Workers only ever write into their own struct,
+so no mutex is needed. After `pthread_join` the main thread sums the
+per-worker counts and concatenates the per-worker instance arrays in chunk
+order, which also keeps the instances in file order. To keep chunks
+disjoint, each worker processes only the lines that start inside its
+[start, end) range: a worker skips the partial line at the start of its
+chunk, and finishes the line that crosses its end, so no line is missed or
+counted twice. With this design the pthread version was about 2.5x faster
+than serial on a 1GB file (0.19s vs 0.49s real).
+
+(3) The chunking logic and the per-chunk result structs are the same in
+both versions; what differs is who manages the threads. With pthreads I had
+to write a worker function with the `void *(*)(void *)` signature, pack its
+arguments into a struct, create each thread with `pthread_create`, check
+for errors, keep an array of `pthread_t` handles, and `pthread_join` every
+one before reading results. I also chose the thread count myself with
+`sysconf`. With OpenMP, a single `#pragma omp parallel for
+num_threads(n)` on an ordinary loop over the chunks does all of that: the
+compiler and runtime create (and reuse) a thread pool, split the loop
+iterations across threads, and put an implicit barrier at the end of the
+loop, so the results are ready as soon as the loop finishes. The chunk
+search becomes a normal function call taking a typed pointer, and the
+thread count comes from `omp_get_max_threads()`. OpenMP still does not
+prevent data races for you: I avoided them the same way, by having
+iteration i write only to args[i] and merging after the loop (a
+`reduction(+:count)` clause would be the OpenMP way to sum a shared
+counter safely). The result is much less code and fewer places to make
+mistakes, at the cost of less fine-grained control over the threads.
